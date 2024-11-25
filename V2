@@ -1,0 +1,195 @@
+import time
+import board
+import busio
+# import sqlite3
+from datetime import datetime
+from typing import Tuple, Optional
+from adafruit_pn532.i2c import PN532_I2C
+
+# 상수 정의
+READER_MODE = 0  # 카드 리더 모드
+ENROLLER_MODE = 1  # 등록기 모드
+API_BASE_URL = "http://your-remote-server:5000"  # 원격 서버 주소
+REQUEST_TIMEOUT = 5  # API 요청 타임아웃(초)
+CARD_READ_TIMEOUT = 1  # 카드 읽기 타임아웃(초)
+
+class PN532Handler:
+    def __init__(self, db_path: str = "access_control.db", retry_count: int = 3):
+        self.db_path = db_path
+        self.retry_count = retry_count
+        self._initialize_pn532()
+        self._init_database()
+    
+    def _initialize_pn532(self):
+        """PN532 초기화, 재시도 메커니즘 포함"""
+        for attempt in range(self.retry_count):
+            try:
+                i2c = busio.I2C(board.SCL, board.SDA)
+                time.sleep(1)
+                self.pn532 = PN532_I2C(i2c, debug=False)
+                self.pn532.SAM_configuration()
+                version = self.pn532.firmware_version
+                print(f"펌웨어 버전 {version}을 가진 PN532를 찾았습니다.")
+                return True
+            except Exception as e:
+                print(f"초기화 시도 {attempt + 1} 실패: {str(e)}")
+                if attempt < self.retry_count - 1:
+                    time.sleep(2)
+                else:
+                    raise RuntimeError("PN532 초기화 실패, 하드웨어 연결을 확인하세요")
+    
+    def read_card(self, timeout: float = 1) -> Optional[str]:
+        """카드 UID 읽기, 재시도 메커니즘 포함"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                uid = self.pn532.read_passive_target(timeout=0.5)
+                if uid is not None:
+                    return bytes(uid).hex()
+            except Exception as e:
+                print(f"카드 읽기 오류: {str(e)}")
+                time.sleep(0.1)
+        return None
+    
+    def check_card_access(self):
+        """카드 리더 모드: 지속적으로 카드 읽기 및 권한 확인"""
+        if self.device_mode != READER_MODE:
+            raise RuntimeError("현재 장치는 카드 리더 모드가 아닙니다.")
+            
+        print("\n카드 읽기 확인 모드 시작... Ctrl+C를 눌러 종료하세요.")
+        try:
+            while True:
+                card_id = self.read_card()
+                if card_id is None:
+                    continue
+                
+                try:
+                    # 원격 서버에 카드 권한 확인 요청
+                    response = requests.get(
+                        f"{API_BASE_URL}/api/entry/{card_id}",
+                        timeout=REQUEST_TIMEOUT
+                    )
+                    if response.status_code == 200 and response.json().get('allowed'):  # 여기 확인!
+                        print(f"입장 환영합니다, 카드 ID: {card_id}")
+                    else:
+                        print(f"경고! 권한 없는 카드 ID: {card_id}")
+                except requests.RequestException as e:
+                    print(f"서버 연결 검증 실패: {str(e)}")
+                
+                time.sleep(0.5)  # 서버에 빈번한 요청 방지
+                
+        except KeyboardInterrupt:
+            print("\n카드 읽기 확인 모드 종료.")
+        except Exception as e:
+            print(f"카드 읽기 확인 모드 오류: {str(e)}")
+    
+    def start_enrollment_server(self, port: int = 5000):
+        """등록기 모드: Flask 서버 시작하여 등록 명령 대기"""
+        if self.device_mode != ENROLLER_MODE:
+            raise RuntimeError("현재 장치는 등록기 모드가 아닙니다.")
+            
+        app = Flask(__name__)
+        
+        @app.route('/api', methods=['POST'])
+        def enroll():
+            try:
+                card_id = self.read_card(timeout=10)  # 10초 동안 카드 읽기 대기
+                if card_id is None:
+                    return jsonify({'status': 'error', 'message': '카드 읽기 시간 초과'}), 408
+                    
+                # 카드 정보를 원격 서버로 전송
+                # 필요에 따라 필드 유지
+                response = requests.post(
+                    f"{API_BASE_URL}/users/enroll",
+                    json={'card_id': card_id},
+                    timeout=REQUEST_TIMEOUT
+                )
+                
+                if response.status_code == 200:
+                    return jsonify({
+                        'type': 'rfid', 
+                        'payload': '???',
+                        'name': None,
+                        'startDt': None, 
+                        'endDt': None, 
+                        'status': 'success',
+                        'card_id': card_id,
+                        'message': '카드 등록 성공'
+                    })
+                else:
+                    return jsonify({
+                        'status': 'error',
+                        'message': '원격 서버 등록 실패'
+                    }), 500
+                    
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': str(e)
+                }), 500
+
+        # 새 스레드에서 Flask 서버 시작
+        Thread(target=lambda: app.run(host='0.0.0.0', port=port, debug=False)).start()
+        print(f"등록 서버가 포트 {port}에서 시작되었습니다.")
+    
+if __name__ == "__main__":
+    try:
+        # 장치 모드에 따라 해당 처리기 인스턴스 생성
+        device_mode = int(input("장치 모드를 선택하세요 (0: 카드 리더 /1: 등록기): "))
+        if device_mode not in (READER_MODE, ENROLLER_MODE):
+            raise ValueError("유효하지 않은 장치 모드입니다.")
+            
+        handler = PN532Handler(device_mode=device_mode)
+        
+        if device_mode == READER_MODE:
+            handler.check_card_access()
+        else:
+            handler.start_enrollment_server()
+            
+    except Exception as e:
+        print(f"프로그램 오류: {str(e)}")
+# 테스트 코드
+'''
+if __name__ == "__main__":
+    try:
+        handler = PN532Handler()
+        print("\n=== 카드 관리 시스템 ===")
+        
+        while True:
+            try:
+                user_input = input(
+                    "\n작업을 선택하세요:\n"
+                    "1. 새 카드 등록\n"
+                    "2. 카드 읽기 확인 모드 시작\n"
+                    "3. 종료\n"
+                    "선택 입력 (1/2/3): "
+                )
+                
+                if user_input == "1":
+                    name = input("소지자 이름을 입력하세요 (기본 이름 사용 시 바로 엔터): ").strip()
+                    status, card_id = handler.enroll_card(name=name if name else "알 수 없음")
+                    print(f"\n등록 상태: {status}")
+                    if card_id:
+                        print(f"카드 ID: {card_id}")
+                
+               
+                elif user_input == "2":
+                    handler.check_card_access()
+
+                elif user_input == "3":
+                    print("\n프로그램 종료")
+                    break
+                 
+                else:
+                    print("\n유효하지 않은 선택입니다. 다시 시도하세요.")
+                    
+            except KeyboardInterrupt:
+                print("\n프로그램 종료")
+                break
+            except Exception as e:
+                print(f"오류: {str(e)}")
+                break
+                
+    except Exception as e:
+        print(f"초기화 오류: {str(e)}")
+'''
